@@ -1,5 +1,5 @@
 # Pruning LLMs by Weights and Activations
-Official PyTorch implementation of **Wanda** (Pruning by **W**eights **and a**ctivations), as presented in our paper:
+
 
 **A Simple and Effective Pruning Approach for Large Language Models** </br>
 *Mingjie Sun\*, Zhuang Liu\*, Anna Bair, J. Zico Kolter* (* indicates equal contribution) <br>
