@@ -324,6 +324,147 @@ def check_tensor(tensor, tensor_name="Tensor", debug=False):
             # print(f"  Inf Count: {inf_count}")
             raise ValueError(f"{tensor_name} has NaNs or Infs!")
 
+def pap_channel_reallocation_order(W_metric: torch.Tensor, prune_m: int) -> torch.Tensor:
+    """
+    Compute a channel reallocation order (i.e., permutation indices)
+    based on the sorted column metrics in W_metric.
+
+    Args:
+        W_metric (torch.Tensor): A 2D tensor with shape [*, num_cols].
+        prune_m (int): The pruning group size.
+
+    Returns:
+        torch.Tensor: A 1D tensor 'index' containing the permutation of columns.
+    """
+    # Sort columns by their summed metric values
+    # (torch.sort returns (sorted_values, sorted_indices), so [1] is the indices)
+    sorted_idx = torch.sort(torch.sum(W_metric, dim=0))[1]
+
+    # Allocate an index tensor with the same shape as sorted_idx
+    index = torch.zeros_like(sorted_idx)
+
+    # Channel reallocation logic
+    for ii in range(1, prune_m + 1):
+        start_pos = int(W_metric.shape[1] * (ii - 1) / prune_m)
+        end_pos = int(W_metric.shape[1] * ii / prune_m)
+
+        if ii % 2 == 1:
+            # Place columns as-is
+            index[ii - 1 :: prune_m] = sorted_idx[start_pos:end_pos]
+        else:
+            # Reverse the columns for alternate chunks
+            index[ii - 1 :: prune_m] = sorted_idx[start_pos:end_pos].flip(0)
+
+    return index
+
+
+def get_eval_permutation(
+    layer_idx: int,
+    name: str,
+    W: torch.Tensor,
+    W_metric: torch.Tensor,
+    prune_m: int,
+    device: torch.device
+) -> torch.Tensor:
+    # 1) Identify the sub-module type from its name
+    module = None
+    if name in ('self_attn.q_proj', 'self_attn.k_proj', 'self_attn.v_proj', 'self_attn.o_proj'):
+        module = 'self'
+    elif name == 'mlp.gate_proj':
+        module = 'gate'
+    elif name == 'mlp.up_proj':
+        module = 'up'
+    elif name == 'mlp.down_proj':
+        module = 'down'
+    
+    # 2) Depending on the module, either load a saved permutation or compute it
+    if module in ('self', 'gate', 'up'):
+        # Load the saved permutations from disk
+        best_permutations = torch.load(f'./p_weight/Layer{layer_idx}_{module}_P_matrix.pt')
+        P_hard = best_permutations[name]
+        P_hard = P_hard.to(W.dtype).to(device)
+
+    elif module == 'down':
+        # 2a) Compute the channel reallocation order
+        #     (Assuming you already have a function that does the logic, e.g.:
+        #      compute_channel_reallocation_order(W_metric, prune_m))
+        index = pap_channel_reallocation_order(W_metric, prune_m)
+
+        # 2b) Construct the permutation matrix
+        P_hard = construct_permutation_matrix(index, device=device)
+        P_hard = P_hard.to(W.dtype)
+
+        # Example check (optional):
+        row_sums = P_hard.sum(dim=1)  # Should be all ones
+        col_sums = P_hard.sum(dim=0)  # Should be all ones
+
+    else:
+        # If the module doesn't match any known category,
+        # either handle as pass-through or raise an error:
+        raise ValueError(f"Module name '{name}' not recognized in eval mode.")
+
+    return P_hard
+
+def compute_permutation_matrix(
+    W: torch.Tensor,
+    permutate_mode: str,
+    permutation_modules: dict,
+    layer_idx: int,
+    name: str,
+    sinkhorn_iterations: int,
+    tau: float,
+    epsilon: float
+) -> (torch.Tensor, torch.Tensor):
+    
+    # Depending on the mode, retrieve the relevant parameters from permutation_modules
+    if permutate_mode == 'lora':
+        U = permutation_modules[(layer_idx, name)].U
+        V = permutation_modules[(layer_idx, name)].V
+        # Create the raw matrix M from U, V
+        M = torch.matmul(U.half(), V.half()).half()
+    elif permutate_mode == 'full':
+        M = permutation_modules[(layer_idx, name)].M.half()
+    else:
+        raise ValueError(f"Unknown permutate_mode {permutate_mode}. Must be 'lora' or 'full'.")
+
+    # Compute Gumbel-Sinkhorn
+    S_soft = gumbel_sinkhorn(M, sinkhorn_iterations, tau, epsilon=epsilon)
+    S_soft = torch.clamp(S_soft, min=1e-8, max=1 - 1e-8)
+
+    # Step 2: Compute the hard permutation matrix P_hard
+    with torch.no_grad():
+        S_cpu = S_soft.detach().cpu().numpy()
+        if not np.isfinite(S_cpu).all():
+            print("Invalid values in S_cpu")
+            print(S_cpu)
+            exit()
+        row_ind, col_ind = linear_sum_assignment(-S_cpu)
+        P_hard = torch.zeros_like(S_soft)
+        P_hard[row_ind, col_ind] = 1.0
+
+    # Let the gradient flow
+    P_hard = (P_hard - S_soft).detach() + S_soft
+    P_hard = P_hard.to(W.dtype)
+
+    return P_hard, S_soft
+
+
+
+class PermutationParams(nn.Module):
+    def __init__(self, num_cols, rank=1, device=None, mode='full'):
+        super().__init__()
+        self.mode = mode
+        if self.mode == 'full':
+            # Full permutation matrix M
+            self.M = nn.Parameter(torch.zeros(num_cols, num_cols, device=device))
+        elif self.mode == 'lora':
+            # LoRA factors U and V
+            self.U = nn.Parameter(torch.randn(num_cols, rank, device=device) * 0.0001)
+            self.V = nn.Parameter(torch.randn(rank, num_cols, device=device) * 0.0001)
+        else:
+            raise ValueError(f"Unknown permutation mode: {self.mode}")
+
+
 def prune_wanda(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0, prune_m=0):
     use_cache = model.config.use_cache 
     model.config.use_cache = False 
@@ -407,34 +548,45 @@ def prune_wanda(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0
                 original_weights[name] = subset[name].weight.data.clone()
             
             # Initialize learnable logits M for each module in the subset
+            
+        permutation_modules = {}
         if i == layer_id or permutate_mode == 'eval':
             rank = 1
             M_dict = {}
-            U_dict = {}
-            V_dict = {}
             original_weight = {}
             for name in subset:
                 if permutate_mode in ('lora', 'full'):
                     if module_name in name:
-                        print(name)
-                        W = subset[name].weight.data  # Shape: [output_dim, input_dim]
-                        original_weight[name] = W
+                        W = subset[name].weight.data
                         num_cols = W.shape[1]
-                        if permutate_mode == 'full':
-                            M_dict[name] = nn.Parameter(torch.zeros(num_cols, num_cols, device=device))
-                        if permutate_mode == 'lora':
-                            U_dict[name] = nn.Parameter(torch.randn(num_cols, rank, device=device) * 0.0001)
-                            V_dict[name] = nn.Parameter(torch.randn(rank, num_cols, device=device) * 0.0001)
+                        
+                        # Create a PermutationParams module
+                        permutation_modules[(i, name)] = PermutationParams(
+                            num_cols=num_cols,
+                            rank=rank,
+                            device=device,
+                            mode=permutate_mode
+                        )
                 if permutate_mode == 'eval':
                     print(name)
                     W = subset[name].weight.data  # Shape: [output_dim, input_dim]
                     original_weight[name] = W
                     num_cols = W.shape[1]
+                    
             if permutate_mode == 'full':
-                optimizer = optim.Adam(M_dict.values(), lr=learning_rate)
-            # Assuming U_dict, V_dict, and M_dict all contain nn.Parameter objects
-            if permutate_mode == 'lora':
-                params_to_optimize = list(U_dict.values()) + list(V_dict.values())
+                # Collect the M parameters
+                params_to_optimize = [
+                    mod.M for mod in permutation_modules.values()
+                    if mod.mode == 'full'
+                ]
+                optimizer = optim.Adam(params_to_optimize, lr=learning_rate)
+
+            elif permutate_mode == 'lora':
+                # Collect all the U and V parameters
+                params_to_optimize = []
+                for mod in permutation_modules.values():
+                    if mod.mode == 'lora':
+                        params_to_optimize.extend([mod.U, mod.V])
                 optimizer = optim.Adam(params_to_optimize, lr=learning_rate)
 
             # output_without_pruned_weights = compute_attention_output_with_pruned_weights(
@@ -451,9 +603,7 @@ def prune_wanda(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0
                 for name in subset:
                     original_weights[name] = subset[name].weight.data.clone()
                 # Dictionary to store permuted and pruned weights and masks
-                W_perm_dict = {}
                 W_pruned_dict = {}
-                W_mask_dict = {}
                 #initial_M = M_dict['mlp.up_proj'].clone().detach()
                 
                 total_preserved_metric = 0.0
@@ -468,78 +618,29 @@ def prune_wanda(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0
                         W = subset[name].weight.data
                         #print(W.shape)
                         if permutate_mode in ('lora', 'full'):
-                            num_cols = W.shape[1]
-                            if permutate_mode == 'lora':
-                                U = U_dict[name]
-                                V = V_dict[name]
-                                M = torch.matmul(U.half(), V.half()).half()
-                                M = torch.clamp(M, min=-10.0, max=10.0)
-                            if permutate_mode == 'full':
-                                M = M_dict[name].half()
-                                M = torch.clamp(M, min=-10.0, max=10.0)
-                            
-                            S_soft = gumbel_sinkhorn(M, sinkhorn_iterations, tau, epsilon=epsilon)
-                            S_soft = torch.clamp(S_soft, min=1e-8, max=1 - 1e-8)
-                            # Step 2: Compute the hard permutation matrix P_hard
-                            with torch.no_grad():
-                                S_cpu = S_soft.detach().cpu().numpy()
-                                if not np.isfinite(S_cpu).all():
-                                    print("Invalid values in S_cpu")
-                                    print(S_cpu)
-                                    exit()
-                                row_ind, col_ind = linear_sum_assignment(-S_cpu)
-                                P_hard = torch.zeros_like(S_soft)
-                                P_hard[row_ind, col_ind] = 1.0
-
-                            # Modify P_hard to allow gradient flow
-                            P_hard = (P_hard - S_soft).detach() + S_soft
-
-                            P_hard = P_hard.to(W.dtype)
-                            
+                            P_hard, S_soft = compute_permutation_matrix(
+                                W,
+                                permutate_mode,
+                                permutation_modules,
+                                i,  # layer_idx
+                                name,
+                                sinkhorn_iterations,
+                                tau,
+                                epsilon
+                            )
                             current_permutations[name] = P_hard.detach().cpu()
+
                         
                         # # Load the best permutation matrices
                         if permutate_mode == 'eval':
-                            #print(name)
-                            module = None
-                            if name in ('self_attn.q_proj', 'self_attn.k_proj', 'self_attn.v_proj', 'self_attn.o_proj'): module = 'self'
-                            if name == 'mlp.gate_proj': module = 'gate'
-                            if name == 'mlp.up_proj': module = 'up'
-                            if name == 'mlp.down_proj': module = 'down'
-                            
-                            if module in ('self', 'gate', 'up'):
-                                best_permutations = torch.load(f'./p_weight/Layer{i}_{module}_P_matrix.pt')
-                                
-                                P_hard = best_permutations[name]
-                                P_hard = P_hard.to(W.dtype)
-                            if module in ('down'):
-                                sorted_idx = torch.sort(torch.sum(W_metric, dim=0))[1]
-
-                                # Channel reallocation (permutation)
-                                index = torch.zeros_like(sorted_idx)
-                                for ii in range(1, prune_m + 1):
-                                    if ii % 2 == 1:
-                                        index[
-                                            ii - 1 :: prune_m
-                                        ] = sorted_idx[
-                                            int(W_metric.shape[1] * (ii - 1) / prune_m) : int(
-                                                W_metric.shape[1] * ii / prune_m
-                                            )
-                                        ]
-                                    else:
-                                        index[
-                                            ii - 1 :: prune_m
-                                        ] = sorted_idx[
-                                            int(W_metric.shape[1] * (ii - 1) / prune_m) : int(
-                                                W_metric.shape[1] * ii / prune_m
-                                            )
-                                        ].flip(0)
-
-                                # Construct P_hard permutation matrix
-                                P_hard = construct_permutation_matrix(index, device=W.device)
-                                P_hard = P_hard.to(W.dtype)
-                                row_sums = P_hard.sum(dim=1)
-                                col_sums = P_hard.sum(dim=0)
+                            P_hard = get_eval_permutation(
+                                layer_idx=i,
+                                name=name,
+                                W=subset[name].weight.data, 
+                                W_metric=W_metric, 
+                                prune_m=prune_m, 
+                                device=W.device
+                            )
                                 
                         W_device = W.device
                         P_hard = P_hard.to(W_device)
@@ -564,27 +665,14 @@ def prune_wanda(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0
                         
                         W_pruned_perm = W_perm.clone()
                         W_pruned_perm[W_mask] = 0
-                        # Map the permuted and pruned weights back to the original order
-                        # Compute the inverse permutation
-                        # inv_perm = torch.argsort(torch.tensor(col_ind)).to(device)
-                        # Map W_pruned_perm back to original order
                         W_pruned = torch.matmul(W_pruned_perm, P_hard.t())
                         # Store pruned weights
                         W_pruned_dict[name] = W_pruned
                         total_preserved_weight += W_pruned.sum()
                         pruned_weights_dict[name] = W_pruned
-                        
-                        
-                        
-
                         subset[name].weight.data = W_pruned.clone()
 
-                # output_with_pruned_weights = compute_attention_output_with_pruned_weights(
-                #     inps, attention_mask, position_ids, pruned_weights_dict, num_attention_heads=32, hidden_dim=4096
-                # )
-                # print("Out:")
-                # print(output_with_pruned_weights.shape)
-                # Forward pass after pruning with permutation
+                
                 outputs_with_perm = []  # Use a list instead of a preallocated tensor
                 for j in range(args.nsamples):
                     output = layer(inps[j].unsqueeze(0),attention_mask=attention_mask,position_ids=position_ids,)[0]
@@ -608,14 +696,7 @@ def prune_wanda(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0
                 #print(f'Diff: {loss_diff}')
                 #loss = -total_preserved_metric/200000 + torch.mean(differences_norm_with_perm)
                 loss = -total_preserved_metric / 100
-                #print(loss.device)
-                #loss = output_with_pruned_weights.sum()
-                #diff = output_with_pruned_weights - output_without_pruned_weights
-                #print(diff)
-                #loss = torch.abs(diff).sum()
-                #loss = -total_preserved_weight
-                #loss = M.sum()
-                #print(f"Loss.requires_grad: {loss.requires_grad}")  # Should be True
+                
                 if permutate_mode in ('lora', 'full'):
                     if loss_diff.item() < best_loss:
                         best_loss = loss_diff.item()
@@ -641,58 +722,15 @@ def prune_wanda(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0
                             print(f'  U Gradient Norm: {U_grad_norm}')
                             print(f'  V Gradient Norm: {V_grad_norm}')
 
-                    #final_M = M_dict['mlp.up_proj'].clone().detach()
-                    #difference = torch.norm(final_M - initial_M)
-                    #print(f'Total change in permutation weights: {difference.item()}')
                     optimizer.step()
                     # Zero the gradients
                     optimizer.zero_grad()
                     for name in subset:
                         subset[name].weight.data = original_weights[name].clone()
             
-                    del W_metric, W, M, S_soft, P_hard, W_perm, W_metric_perm, W_mask
+                    #del W_metric, W, M, S_soft, P_hard, W_perm, W_metric_perm, W_mask
                     torch.cuda.empty_cache()
-                    # for h in handles:
-                    #     h.remove()
-                    # del handles
-        # -------------------------------------------------------------------------------------------------------------------------    
-        # Step 1: Pruning without permutation
-        # for name in subset:
-        #     if "self" in name or permutate_mode == 'eval':
-        #         print(f"Pruning layer {i} name {name} without permutation")
-        #         W_metric = torch.abs(subset[name].weight.data) * torch.sqrt(wrapped_layers[name].scaler_row.reshape((1,-1)))
-
-        #         W_mask = (torch.zeros_like(W_metric) == 1)  ## initialize a mask to be all False
-        #         if prune_n != 0:
-        #             # structured n:m sparsity
-        #             for ii in range(W_metric.shape[1]):
-        #                 if ii % prune_m == 0:
-        #                     tmp = W_metric[:,ii:(ii+prune_m)].float()
-        #                     W_mask.scatter_(1,ii+torch.topk(tmp, prune_n,dim=1, largest=False)[1], True)
-
-        #         subset[name].weight.data[W_mask] = 0  ## set weights to zero 
-        # outputs_after_pruning_no_perm = torch.zeros_like(outs)
-        # for j in range(args.nsamples):
-        #     with torch.no_grad():
-        #         outputs_after_pruning_no_perm[j] = layer(inps[j].unsqueeze(0),attention_mask=attention_mask,position_ids=position_ids,)[0]
-        # differences_norm_no_perm = []
-        # for j in range(args.nsamples):
-        #     diff_norm = torch.norm(outputs_after_pruning_no_perm[j] - outputs_before_pruning[j])
-        #     differences_norm_no_perm.append(diff_norm.item())
-            
-        # # Restore original weights before permutation
-        # for name in subset:
-        #     if "self" in name:
-        #         subset[name].weight.data = original_weights[name].clone()
-        # -------------------------------------------------------------------------------------------------------------------------    
-        
-        # -------------------------------------------------------------------------------------------------------------------------  
-        # print(f"Layer {i} difference norms:")
-        # for j in range(args.nsamples):
-        #     print(
-        #         f"Sample {j}: Without Permutation = {differences_norm_no_perm[j]:.6f}, "
-        #         f"With Permutation = {differences_norm_with_perm[j]:.6f}"
-        #     )
+                    
         outputs_after_pruning = torch.zeros_like(outs)
         for j in range(args.nsamples):
             with torch.no_grad():
@@ -700,18 +738,6 @@ def prune_wanda(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0
                 outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask, position_ids=position_ids)[0]
         inps, outs = outs, inps
         
-        # differences_norm = []
-        # for j in range(args.nsamples):
-        #     # print(outputs_before_pruning[j])
-        #     # print(outputs_after_pruning[j])
-        #     diff_norm = torch.norm(outputs_after_pruning[j] - outputs_before_pruning[j])
-        #     differences_norm.append(diff_norm.item())
-
-        # print(f"Differences for layer {i}:")
-        # for j in range(args.nsamples):
-        #     print(f"Sample {j}: Difference Norm = {differences_norm[j]}")
-            
-        #break
 
     
     model.config.use_cache = use_cache 
